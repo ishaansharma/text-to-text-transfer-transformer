@@ -13,14 +13,14 @@
 # limitations under the License.
 
 # Lint as: python3
-"""Tests for t5.data.utils."""
+"""Tests for seqio.utils."""
 from typing import Mapping, Sequence
 
 from absl.testing import absltest
 from absl.testing import parameterized
 import numpy as np
-from t5.data import test_utils
-from t5.data import utils
+from t5.seqio import test_utils
+from t5.seqio import utils
 import tensorflow.compat.v2 as tf
 import tensorflow_datasets as tfds
 
