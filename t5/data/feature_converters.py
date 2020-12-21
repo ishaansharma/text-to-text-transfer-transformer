@@ -719,3 +719,214 @@ def get_dataset(
       logging.info("feature: %s \t shape: %s \t dtype: %s", feature_name,
                    tensor_spec.shape.as_list(), tensor_spec.dtype.name)
   return ds
+
+
+class LMFeatureConverter(FeatureConverter):
+  """Feature converter for a language model (decoder-only) architecture.
+
+  The input dataset must have "targets" field only.
+
+  One common usecase is to pre-train a decoder-only model with the standard
+  language modeling objective (i.e., predict the next token given the previous
+  ones) on a unlabeled text corpus which only has "targets". Then the
+  pre-trained model can be fine-tuned on a supervised task, e.g., machine
+  translation by concatenating "inputs" and "targets". For this use case,
+  pre-train with LMFeatureConverter and fine-tune with PrefixLMFeatureConverter.
+
+  Example: a packed dataset.
+
+    ds = [{"targets": [3, 9, 1]}, {"targets": [4, 1]}]
+
+    input_lengths = {"targets": 6}
+
+    converted_ds = {
+        "decoder_target_token": [3, 9, 1, 4, 1, 0],
+         "decoder_input_token": [0, 3, 9, 0, 4, 0],
+         "decoder_loss_weight": [1, 1, 1, 1, 1, 0],
+            "decoder_position": [0, 1, 2, 0, 1, 0],
+          "decoder_segment_id": [1, 1, 1, 2, 2, 0]
+    }
+  Note that two examples are packed together into one example.
+  """
+  TASK_FEATURE_DTYPES = {"targets": tf.int32}
+  MODEL_FEATURE_DTYPES = {
+      "decoder_target_tokens": tf.int32,
+      "decoder_input_tokens": tf.int32,
+      "decoder_loss_weights": tf.int32,
+  }
+  PACKING_FEATURE_DTYPES = {
+      "decoder_segment_ids": tf.int32,
+      "decoder_positions": tf.int32
+  }
+
+  def convert_example(
+      self, features: Mapping[str, tf.Tensor]) -> Mapping[str, tf.Tensor]:
+    """Convert an LM example into an example with model features."""
+    # targets_segment_id is present only for a packed dataset.
+    decoder_input_token = autoregressive_inputs(
+        features["targets"],
+        sequence_id=features.get("targets_segment_ids", None))
+
+    d = {"decoder_target_tokens": features["targets"],
+         "decoder_input_tokens": decoder_input_token,
+         "decoder_loss_weights": non_padding_position(features["targets"])}
+
+    if self.pack:
+      d["decoder_segment_ids"] = features["targets_segment_ids"]
+      d["decoder_positions"] = features["targets_positions"]
+
+    return d
+
+  def _convert_features(
+      self, ds: tf.data.Dataset,
+      task_feature_lengths: Mapping[str, int]) -> tf.data.Dataset:
+    """Convert the dataset to be fed to a language model."""
+    ds = self._pack_or_pad(ds, task_feature_lengths)
+    return ds.map(
+        self.convert_example, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+
+  def get_model_feature_lengths(
+      self, task_feature_lengths: Mapping[str, int]) -> Mapping[str, int]:
+    """Define the length relationship between task and model features."""
+    decoder_length = task_feature_lengths["targets"]
+    model_feature_lengths = {
+        "decoder_target_tokens": decoder_length,
+        "decoder_input_tokens": decoder_length,
+        "decoder_loss_weights": decoder_length
+    }
+    if self.pack:
+      model_feature_lengths["decoder_segment_ids"] = decoder_length
+      model_feature_lengths["decoder_positions"] = decoder_length
+
+    return model_feature_lengths
+
+
+class PrefixLMFeatureConverter(LMFeatureConverter):
+  """Feature converter for a prefix language model architecture.
+
+  The input dataset must have both "inputs" and "targets" fields. For language
+  modeling objective with "targets" only dataset, use LMFeatureConverter.
+
+  A decoder is a network which autoregressively produces an output sequence. It
+  can be used for an input dataset which has a notion of "inputs" as well as
+  "targets", (e.g., machine translation) by concatenating them to form the new
+  targets. See Raffel et al. (2020), https://arxiv.org/abs/1910.10683, Section
+  3.2.1 for more detailed take on this topic.
+
+  Because the "inputs" part does not require a causal attention pattern, the
+  self-attention for the "inputs" portion of the concatenated sequence can be
+  fully visible. This architecture is referred to as Prefix Language Model by
+  Raffel et al. (2020). This class provides `inputs_attention_mask` field, which
+  is a binary mask where a value of 1 represents that the correponding input
+  token to the decoder belongs to the "inputs" before concatenation. Consider
+  the following example.
+
+  Example: a packed dataset
+
+    ds = [{"inputs": [7, 8, 5, 1], "targets": [3, 9, 1]},
+          {"inputs": [8, 4, 9, 3, 1], "targets": [4, 1]}]
+
+    task_feature_lengths = {"inputs": 7, "targets": 8}
+
+    converted_ds = {
+        "decoder_target_token": [7, 8, 5, 1, 3, 9, 1, 8, 4, 9, 3, 1, 4, 1, 0],
+         "decoder_input_token": [0, 7, 8, 5, 1, 3, 9, 0, 8, 4, 9, 3, 1, 4, 0],
+         "decoder_loss_weight": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+            "decoder_position": [0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 0],
+          "decoder_segment_id": [1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 0],
+       "inputs_attention_mask": [1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0]
+    }
+
+  Note that inputs_attention_mask[4] = 1 even though the decoder_target_token[4]
+  belongs to the "targets" portion before concatenation. This is because during
+  the decoder forward pass, decoder_input_token[4] = 1, which corresponds to the
+  EOS token from the "inputs" portion. By including the EOS token in the
+  self-attention, the contextual representation of the "inputs" portion may have
+  a notion of where the "inputs" sequence end.
+  """
+  TASK_FEATURE_DTYPES = {"inputs": tf.int32, "targets": tf.int32}
+  MODEL_FEATURE_DTYPES = {
+      "decoder_target_tokens": tf.int32,
+      "decoder_input_tokens": tf.int32,
+      "decoder_loss_weights": tf.int32,
+      "inputs_attention_mask": tf.int32
+  }
+  PACKING_FEATURE_DTYPES = {
+      "decoder_segment_ids": tf.int32,
+      "decoder_positions": tf.int32
+  }
+  _OFFSET = 5
+
+  def convert_example(
+      self, features: Mapping[str, tf.Tensor]) -> Mapping[str, tf.Tensor]:
+    """Convert a Prefix LM example into an example with model features."""
+    # First use the standard LM conversion.
+    lm_features = super().convert_example(features)
+
+    # Subtract out the dummy offset to represent the mask with 1 and 0.
+    inputs_attention_mask = features["inputs_attention_mask"] - self._OFFSET
+    inputs_attention_mask *= lm_features["decoder_loss_weights"]
+    d = dict(lm_features)
+    d["inputs_attention_mask"] = inputs_attention_mask
+    return d
+
+  def _convert_features(
+      self, ds: tf.data.Dataset,
+      task_feature_lengths: Mapping[str, int]) -> tf.data.Dataset:
+    """Convert the input dataset to an output dataset to be fed to the model.
+
+    The "inputs" and "targets" are concatenated to form the new targets. In
+    addition, the binary mask to distinguish "inputs" and "targets" token are
+    concatenated as well. We add a dummy offset value of 5 so that during the
+    packing process, the binary mask has the value of 5 and 6 instead of 0 and
+    1. This is because the packing function assumes that the EOS and padding ids
+    are 1 and 0. So the resulting packing pattern is incorrect for the binary
+    mask. We subtract out this offset to recover the 0/1 mask.
+
+    Args:
+      ds: an input tf.data.Dataset to be converted.
+      task_feature_lengths: a mapping from task feature name to its length.
+
+    Returns:
+      ds: the converted dataset.
+    """
+    def concat_and_add_masks(features):
+      inputs = features["inputs"]
+      targets = features["targets"]
+      inputs_mask = tf.ones_like(inputs) + self._OFFSET
+      targets_mask = tf.zeros_like(targets) + self._OFFSET
+
+      # The fully visible attention span can include an additional position
+      # where the EOS token of the inputs is a decoder input and the first token
+      # of the targets is the decoder output token.
+      targets_mask = tf.concat(
+          [[self._OFFSET + 1], targets_mask[1:]], axis=-1)
+
+      return {
+          "targets": tf.concat([inputs, targets], axis=-1),
+          "inputs_attention_mask":
+              tf.concat([inputs_mask, targets_mask], axis=-1)
+      }
+
+    ds = ds.map(
+        concat_and_add_masks, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+
+    concat_length = sum(task_feature_lengths.values())
+    concat_task_feature_lengths = {
+        "targets": concat_length,
+        "inputs_attention_mask": concat_length
+    }
+
+    ds = self._pack_or_pad(ds, concat_task_feature_lengths)
+    return ds.map(
+        self.convert_example, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+
+  def get_model_feature_lengths(
+      self, task_feature_lengths: Mapping[str, int]) -> Mapping[str, int]:
+    """Define the length relationship between task and model features."""
+    decoder_length = sum(task_feature_lengths.values())
+    concat_length = {"targets": decoder_length}
+    lm_model_feature_lengths = super().get_model_feature_lengths(concat_length)
+    model_feature_lengths = dict(lm_model_feature_lengths)
+    model_feature_lengths["inputs_attention_mask"] = decoder_length
+    return model_feature_lengths
